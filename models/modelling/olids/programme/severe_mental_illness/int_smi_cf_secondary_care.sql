@@ -111,7 +111,7 @@ WHERE HAS_ACTIVE_SMI_DIAGNOSIS
     ,sp.uniq_hosp_prov_spell_num as spell_number
     ,ws.uniq_ward_stay_id
     ,ws.ward_code
-    ,wd.site_name
+    ,NVL(wd.site_name, 'Unknown') as site_name
     ,DATE(sp.start_date_hosp_prov_spell) as spell_start_date
     ,DATE(sp.disch_date_hosp_prov_spell) as spell_discharge_date
     ,sp.disch_date_hosp_prov_spell is null as is_current_spell  
@@ -149,7 +149,7 @@ sk_patient_id
 ,admission_type
 ,ward_type
 ,ward_code
-,site_name
+,CASE WHEN ward_code = 'HCPH' THEN 'Haringey' ELSE site_name END AS site_name
 ,spell_number
 ,spell_start_date
 ,start_date_ward_stay

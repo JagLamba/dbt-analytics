@@ -4,7 +4,7 @@
         cluster_by=['person_id'])
 }}
 
--- Complex Adults Cohort v2.1
+-- Complex Adults Cohort v2.2
 -- One row per person meeting all cohort criteria:
 --   Age >= 18
 --   AND at least one complexity criterion:
@@ -14,11 +14,20 @@
 --       OR on the palliative care register
 --       OR alcohol misuse
 --       OR substance misuse
+--       OR high acute use with no GP contact (>=3 ED attendances OR >=2 NEL
+--          admissions, AND 0 attended GP appointments, all in 12 months)
 --   AND at least one activity criterion:
 --       >=2 NEL admissions OR >=3 ED attendances
 --       OR >=15 attended GP appointments (all rolling 12 months)
 --       OR attended outpatient care across >=5 treatment-function specialties
 --       OR housebound
+--
+-- Changes from v2.1:
+--   - High acute use with no GP contact joins the complexity limb. Anyone
+--     meeting it also meets the ED/NEL activity criteria, so it acts as a
+--     direct entry route for people cycling through acute services with no
+--     primary care footprint (and therefore no coded LTC/frailty/register
+--     data to catch them via the other complexity criteria).
 --
 -- Changes from v2.0:
 --   - GP activity joins the utilisation limb: >=15 attended clinical
@@ -58,60 +67,7 @@
 -- complexity_criteria_count, so the marginal contribution of any single
 -- criterion can be measured without rebuilding the model.
 
-WITH ltc AS (
-    SELECT
-        s.person_id,
-        BOOLOR_AGG(s.condition_code = 'AF') AS has_af,
-        BOOLOR_AGG(s.condition_code = 'AST') AS has_asthma,
-        BOOLOR_AGG(s.condition_code = 'CHD') AS has_chd,
-        BOOLOR_AGG(s.condition_code = 'CKD') AS has_ckd,
-        BOOLOR_AGG(s.condition_code = 'COPD') AS has_copd,
-        BOOLOR_AGG(s.condition_code = 'DEM') AS has_dementia,
-        BOOLOR_AGG(s.condition_code = 'DEP') AS has_depression,
-        BOOLOR_AGG(s.condition_code = 'DM') AS has_diabetes,
-        BOOLOR_AGG(s.condition_code = 'EP') AS has_epilepsy,
-        BOOLOR_AGG(s.condition_code = 'HF') AS has_heart_failure,
-        BOOLOR_AGG(s.condition_code = 'HTN') AS has_hypertension,
-        BOOLOR_AGG(s.condition_code = 'SMI') AS has_smi,
-        BOOLOR_AGG(s.condition_code = 'STIA') AS has_stroke_tia,
-        BOOLOR_AGG(s.condition_code = 'PD') AS has_parkinsons,
-        BOOLOR_AGG(s.condition_code = 'ANX') AS has_anxiety,
-        BOOLOR_AGG(s.condition_code = 'LD') AS has_learning_disability,
-        COUNT(DISTINCT s.condition_code) AS ltc_count
-    FROM {{ ref('fct_person_ltc_summary') }} AS s
-    INNER JOIN {{ ref('dim_person_age') }} AS a
-        ON s.person_id = a.person_id
-    WHERE (
-        s.condition_code IN (
-            'AF', 'AST', 'CHD', 'CKD', 'COPD', 'DEM', 'DEP', 'DM',
-            'EP', 'HF', 'HTN', 'SMI', 'STIA', 'PD', 'ANX'
-        )
-        -- Learning disability counts towards the LTC total only at 65+
-        OR (s.condition_code = 'LD' AND a.age >= 65)
-    )
-    GROUP BY s.person_id
-),
-
-gp_max_date AS (
-    SELECT MAX(start_date) AS max_date
-    FROM {{ ref('int_appointment_gp_clinical_recent') }}
-    WHERE is_attended AND start_date <= CURRENT_DATE()
-),
-
-gp_appointments AS (
-    SELECT
-        a.person_id,
-        COUNT(*) AS gp_appointments_12mo
-    FROM {{ ref('int_appointment_gp_clinical_recent') }} AS a
-    CROSS JOIN gp_max_date AS m
-    WHERE
-        a.is_attended
-        AND a.start_date >= DATEADD(MONTH, -12, m.max_date)
-        AND a.start_date <= m.max_date
-    GROUP BY a.person_id
-),
-
-complexity AS (
+WITH complexity AS (
     SELECT
         d.person_id,
         d.sk_patient_id,
@@ -179,6 +135,16 @@ complexity AS (
         COALESCE(sub.has_substance_misuse, FALSE) AS has_substance_misuse,
         sub.latest_qualifying_date AS latest_substance_misuse_date,
 
+        -- High acute use with no GP contact: (>=3 ED attendances OR >=2 NEL
+        -- admissions in 12 months) AND no attended GP appointment in the GP
+        -- 12-month window. No row in int_segmentation_gp_activity means zero
+        -- attended clinical appointments, so the GP side matches the >=15
+        -- criterion's definition (DNAs and admin excluded, lag-aware window).
+        (
+            (ZEROIFNULL(ae.ae_tot_12mo) >= 3 OR ZEROIFNULL(ip.apc_nel_12mo) >= 2)
+            AND gp.person_id IS NULL
+        ) AS has_high_acute_use_no_gp,
+
         -- Utilisation
         ZEROIFNULL(ip.apc_nel_12mo) AS nel_admissions_12mo,
         ZEROIFNULL(ae.ae_tot_12mo) AS ed_attendances_12mo,
@@ -187,7 +153,7 @@ complexity AS (
         COALESCE(h.is_housebound, FALSE) AS is_housebound
 
     FROM {{ ref('dim_person_demographics') }} AS d
-    LEFT JOIN ltc AS l
+    LEFT JOIN {{ ref('int_segmentation_complex_adults_ltc') }} AS l
         ON d.person_id = l.person_id
     LEFT JOIN {{ ref('fct_person_efi2') }} AS e
         ON d.person_id = e.person_id
@@ -201,7 +167,7 @@ complexity AS (
         ON d.person_id = alc.person_id
     LEFT JOIN {{ ref('int_substance_misuse_status') }} AS sub
         ON d.person_id = sub.person_id
-    LEFT JOIN gp_appointments AS gp
+    LEFT JOIN {{ ref('int_segmentation_gp_activity') }} AS gp
         ON d.person_id = gp.person_id
     LEFT JOIN {{ ref('fct_person_sus_op_recent') }} AS op
         ON d.sk_patient_id = op.sk_patient_id
@@ -216,7 +182,7 @@ complexity AS (
 
 SELECT
     *,
-    -- How many of the six complexity criteria the person meets. A value of 1
+    -- How many of the seven complexity criteria the person meets. A value of 1
     -- means removing that single criterion would remove the person from the
     -- cohort, so this supports marginal-contribution reporting directly.
     (
@@ -226,6 +192,7 @@ SELECT
         + is_on_palliative_care_register::INT
         + has_alcohol_misuse::INT
         + has_substance_misuse::INT
+        + has_high_acute_use_no_gp::INT
     ) AS complexity_criteria_count
 
 FROM complexity
@@ -237,6 +204,7 @@ WHERE (
     OR is_on_palliative_care_register
     OR has_alcohol_misuse
     OR has_substance_misuse
+    OR has_high_acute_use_no_gp
 )
 -- Activity or housebound
 AND (
